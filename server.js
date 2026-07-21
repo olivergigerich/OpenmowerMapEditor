@@ -1104,7 +1104,14 @@ async function collectAutonomousWifiSample() {
   wifiCollectorLastDurationMs = now - startedAt;
   wifiCollectorLastError = null;
 
-  if (shouldStore && mergeWifiSurveySample(probe)) {
+  if (
+    shouldStore &&
+    mergeWifiSurveySample({
+      x: probe.x,
+      y: probe.y,
+      signalDbm: probe.wifi.signalDbm,
+    })
+  ) {
     wifiCollectorStoredCount += 1;
     wifiCollectorLastStoredAt = Date.now();
     return true;

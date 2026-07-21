@@ -25,6 +25,23 @@ const wifiFlushMs = Math.max(
   10000,
   Math.min(300000, Math.floor(Number(process.env.WIFI_MAP_FLUSH_MS) || 30000))
 );
+const wifiCollectorIntervalMs = Math.max(
+  5000,
+  Math.min(300000, Math.floor(Number(process.env.WIFI_MAP_COLLECTOR_INTERVAL_MS) || 10000))
+);
+const wifiCollectorTfTimeoutSec = Math.max(
+  1,
+  Math.min(5, Math.floor(Number(process.env.WIFI_MAP_COLLECTOR_TF_TIMEOUT_SEC) || 2))
+);
+const wifiCollectorCellRevisitMs = Math.max(
+  60000,
+  Math.min(
+    3600000,
+    Math.floor(Number(process.env.WIFI_MAP_COLLECTOR_CELL_REVISIT_MS) || 300000)
+  )
+);
+const wifiCollectorDisabled =
+  String(process.env.WIFI_MAP_COLLECTOR_DISABLE || "").trim() === "1";
 const distDir = path.join(__dirname, "dist");
 const dockerSocketPath = process.env.DOCKER_SOCKET_PATH || "/var/run/docker.sock";
 const restartContainerName = process.env.OPENMOWER_CONTAINER_NAME || "open_mower_ros";
@@ -75,6 +92,18 @@ let wifiSurveyFlushPromise = null;
 let wifiSurveyRevision = 0;
 let wifiSurveyUpdatedAt = null;
 let wifiSurveyLastBytes = 0;
+let wifiCollectorTimer = null;
+let wifiCollectorInFlight = false;
+let wifiCollectorStopped = false;
+let wifiCollectorSuccessCount = 0;
+let wifiCollectorFailureCount = 0;
+let wifiCollectorStoredCount = 0;
+let wifiCollectorLastCollectedAt = null;
+let wifiCollectorLastStoredAt = null;
+let wifiCollectorLastSignalDbm = null;
+let wifiCollectorLastInterface = null;
+let wifiCollectorLastDurationMs = null;
+let wifiCollectorLastError = null;
 
 function wifiCellKey(x, y) {
   return `${Math.round(x / wifiCellSizeM)},${Math.round(y / wifiCellSizeM)}`;
@@ -157,7 +186,21 @@ async function ensureWifiSurveyLoaded() {
       wifiSurveyLastBytes = Buffer.byteLength(content, "utf8");
       const parsed = JSON.parse(content);
       const samples = Array.isArray(parsed?.samples) ? parsed.samples.slice(-wifiMaxPoints) : [];
-      for (const sample of samples) mergeWifiSurveySample(sample, false);
+      for (const sample of samples) {
+        const normalized = normalizeWifiSample(sample);
+        if (!normalized) continue;
+        const timestamp = Number(sample.timestamp);
+        const sampleCount = Number(sample.samples);
+        wifiSurvey.set(normalized.key, {
+          x: normalized.x,
+          y: normalized.y,
+          signalDbm: Number(normalized.signalDbm.toFixed(1)),
+          samples: Number.isFinite(sampleCount)
+            ? Math.max(1, Math.min(1000000, Math.floor(sampleCount)))
+            : 1,
+          timestamp: Number.isFinite(timestamp) ? timestamp : normalized.timestamp,
+        });
+      }
       wifiSurveyUpdatedAt = Number(parsed?.updatedAt) || null;
       wifiSurveyRevision = 1;
       logInfo("Loaded central WiFi survey", {
@@ -266,6 +309,22 @@ function wifiSurveyMeta() {
       maxPoints: wifiMaxPoints,
       flushIntervalMs: wifiFlushMs,
       fileBytes: wifiSurveyLastBytes,
+      collector: {
+        enabled: !wifiCollectorDisabled && !poseDisabled,
+        intervalMs: wifiCollectorIntervalMs,
+        tfTimeoutSec: wifiCollectorTfTimeoutSec,
+        cellRevisitMs: wifiCollectorCellRevisitMs,
+        inFlight: wifiCollectorInFlight,
+        successCount: wifiCollectorSuccessCount,
+        failureCount: wifiCollectorFailureCount,
+        storedCount: wifiCollectorStoredCount,
+        lastCollectedAt: wifiCollectorLastCollectedAt,
+        lastStoredAt: wifiCollectorLastStoredAt,
+        lastSignalDbm: wifiCollectorLastSignalDbm,
+        lastInterface: wifiCollectorLastInterface,
+        lastDurationMs: wifiCollectorLastDurationMs,
+        lastError: wifiCollectorLastError,
+      },
     },
   };
 }
@@ -479,6 +538,41 @@ function buildRobotPoseProbeBash() {
     "  done",
     "done",
     'echo "ERR no TF transform (tried map/odom -> base_link/base_footprint)"',
+    "exit 1",
+  ].join("\n");
+}
+
+function buildWifiCollectorProbeBash() {
+  const b64 = Buffer.from(ROBOT_TF_PARSE_PY, "utf8").toString("base64");
+  return [
+    "set +e",
+    "for SETUP in /opt/ros/humble/setup.bash /opt/ros/jazzy/setup.bash /opt/ros/iron/setup.bash /opt/ros/noetic/setup.bash; do",
+    '  [ -f "$SETUP" ] || continue',
+    '  . "$SETUP"',
+    "  break",
+    "done",
+    "for WS in /opt/open_mower_ros/devel/setup.bash /ros_ws/install/setup.bash /workspace/install/setup.bash /colcon_ws/install/setup.bash /catkin_ws/devel/setup.bash /open_mower/install/setup.bash; do",
+    '  [ -f "$WS" ] || continue',
+    '  . "$WS"',
+    "  break",
+    "done",
+    "if command -v ros2 >/dev/null 2>&1; then",
+    `  run_tf() { timeout ${wifiCollectorTfTimeoutSec} ros2 run tf2_ros tf2_echo map "$1" 2>/dev/null; }`,
+    "elif command -v rosrun >/dev/null 2>&1; then",
+    `  run_tf() { timeout ${wifiCollectorTfTimeoutSec} rosrun tf tf_echo map "$1" 2>/dev/null; }`,
+    "else",
+    '  echo "ERR no ros2 or rosrun in PATH after sourcing /opt/ros"',
+    "  exit 1",
+    "fi",
+    "for child in base_link base_footprint; do",
+    `  parsed=$(run_tf "$child" | head -n 20 | python3 <(echo '${b64}' | base64 -d)) || continue`,
+    '  echo "OK $parsed map $child"',
+    "  echo WIFI_BEGIN",
+    "  cat /proc/net/wireless 2>/dev/null",
+    "  echo WIFI_END",
+    "  exit 0",
+    "done",
+    'echo "ERR no TF transform (tried map -> base_link/base_footprint)"',
     "exit 1",
   ].join("\n");
 }
@@ -973,6 +1067,106 @@ async function fetchRobotPoseFromRosContainer() {
   return parseRobotProbeOutput(stdout || stderr || "");
 }
 
+async function collectAutonomousWifiSample() {
+  const startedAt = Date.now();
+  const { stdout, stderr } = await dockerExecInContainer(poseContainerName, [
+    "/bin/bash",
+    "-lc",
+    buildWifiCollectorProbeBash(),
+  ]);
+  const probe = parseRobotProbeOutput(stdout || stderr || "");
+  if (
+    !probe.ok ||
+    probe.frameParent !== "map" ||
+    !Number.isFinite(probe.x) ||
+    !Number.isFinite(probe.y) ||
+    !Number.isFinite(probe.wifi?.signalDbm)
+  ) {
+    throw new Error(probe.error || "WiFi collector probe returned no map pose or signal");
+  }
+
+  await ensureWifiSurveyLoaded();
+  const now = Date.now();
+  const key = wifiCellKey(probe.x, probe.y);
+  const previous = wifiSurvey.get(key);
+  const previousAgeMs = previous ? now - Number(previous.timestamp || 0) : Infinity;
+  const signalChangeDbm = previous
+    ? Math.abs(Number(previous.signalDbm) - probe.wifi.signalDbm)
+    : Infinity;
+  const shouldStore =
+    !previous ||
+    (previousAgeMs >= wifiCollectorCellRevisitMs && signalChangeDbm >= 3);
+
+  wifiCollectorSuccessCount += 1;
+  wifiCollectorLastCollectedAt = now;
+  wifiCollectorLastSignalDbm = probe.wifi.signalDbm;
+  wifiCollectorLastInterface = probe.wifi.interface || null;
+  wifiCollectorLastDurationMs = now - startedAt;
+  wifiCollectorLastError = null;
+
+  if (shouldStore && mergeWifiSurveySample(probe)) {
+    wifiCollectorStoredCount += 1;
+    wifiCollectorLastStoredAt = Date.now();
+    return true;
+  }
+  return false;
+}
+
+function scheduleAutonomousWifiCollector(delayMs = wifiCollectorIntervalMs) {
+  if (wifiCollectorDisabled || poseDisabled || wifiCollectorStopped || wifiCollectorTimer) return;
+  wifiCollectorTimer = setTimeout(async () => {
+    wifiCollectorTimer = null;
+    if (wifiCollectorInFlight) {
+      scheduleAutonomousWifiCollector();
+      return;
+    }
+    wifiCollectorInFlight = true;
+    const startedAt = Date.now();
+    try {
+      await collectAutonomousWifiSample();
+    } catch (error) {
+      wifiCollectorFailureCount += 1;
+      wifiCollectorLastDurationMs = Date.now() - startedAt;
+      wifiCollectorLastError = error.message || "WiFi collector failed";
+      if (wifiCollectorFailureCount === 1 || wifiCollectorFailureCount % 30 === 0) {
+        logWarn("Autonomous WiFi collector failed", {
+          failures: wifiCollectorFailureCount,
+          error: wifiCollectorLastError,
+        });
+      }
+    } finally {
+      wifiCollectorInFlight = false;
+      const elapsedMs = Date.now() - startedAt;
+      scheduleAutonomousWifiCollector(Math.max(1000, wifiCollectorIntervalMs - elapsedMs));
+    }
+  }, delayMs);
+  wifiCollectorTimer.unref?.();
+}
+
+function startAutonomousWifiCollector() {
+  if (wifiCollectorDisabled || poseDisabled) {
+    logInfo("Autonomous WiFi collector disabled", {
+      wifiCollectorDisabled,
+      poseDisabled,
+    });
+    return;
+  }
+  wifiCollectorStopped = false;
+  logInfo("Autonomous WiFi collector enabled", {
+    intervalMs: wifiCollectorIntervalMs,
+    tfTimeoutSec: wifiCollectorTfTimeoutSec,
+    cellRevisitMs: wifiCollectorCellRevisitMs,
+  });
+  scheduleAutonomousWifiCollector(1500);
+}
+
+function stopAutonomousWifiCollector() {
+  wifiCollectorStopped = true;
+  if (!wifiCollectorTimer) return;
+  clearTimeout(wifiCollectorTimer);
+  wifiCollectorTimer = null;
+}
+
 async function getRobotPoseCached() {
   const now = Date.now();
   if (robotPoseCache.payload && robotPoseCache.expiresAt > now) {
@@ -1220,6 +1414,18 @@ app.post("/api/wifi-map/samples", async (req, res) => {
 app.delete("/api/wifi-map", async (_req, res) => {
   try {
     await ensureWifiSurveyLoaded();
+    await flushWifiSurvey(true);
+    const clearBackupPath = `${wifiMapPath}.bak-clear`;
+    try {
+      await fs.copyFile(wifiMapPath, clearBackupPath);
+      await applyMowerFileOwnership(clearBackupPath);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    logWarn("Clearing central WiFi survey", {
+      points: wifiSurvey.size,
+      backup: clearBackupPath,
+    });
     wifiSurvey.clear();
     wifiSurveyDirty = true;
     wifiSurveyRevision += 1;
@@ -1396,7 +1602,12 @@ const server = app.listen(port, () => {
     wifiCellSizeM,
     wifiMaxPoints,
     wifiFlushMs,
+    wifiCollectorIntervalMs,
+    wifiCollectorTfTimeoutSec,
+    wifiCollectorCellRevisitMs,
+    wifiCollectorDisabled,
   });
+  startAutonomousWifiCollector();
 });
 
 let shuttingDown = false;
@@ -1404,6 +1615,7 @@ async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   logInfo("Shutting down", { signal });
+  stopAutonomousWifiCollector();
   server.close();
   try {
     await flushWifiSurvey(true);

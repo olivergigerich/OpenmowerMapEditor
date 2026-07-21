@@ -21,6 +21,11 @@ export const wifiSurveyStorage = writable({
   maxPoints: 2000,
   flushIntervalMs: 30000,
   fileBytes: 0,
+  collector: {
+    enabled: true,
+    intervalMs: 10000,
+    cellRevisitMs: 300000,
+  },
 });
 
 wifiMapEnabled.subscribe((enabled) => {
@@ -50,6 +55,13 @@ let lastRecordCell = null;
 function applyServerPayload(data) {
   if (Number.isFinite(data?.revision)) knownRevision = data.revision;
   if (data?.storage) wifiSurveyStorage.set(data.storage);
+  const collector = data?.storage?.collector;
+  if (Number.isFinite(collector?.lastSignalDbm)) {
+    latestWifiSignal.set({
+      signalDbm: collector.lastSignalDbm,
+      interface: collector.lastInterface || null,
+    });
+  }
   if (!data?.notModified && Array.isArray(data?.samples)) {
     wifiSamples.set(data.samples);
   }
@@ -98,6 +110,8 @@ export function ingestWifiPose(pose) {
   if (!Number.isFinite(signalDbm)) return;
   latestWifiSignal.set(pose.wifi);
   if (!get(wifiMapEnabled) || !pose?.ok || recordInFlight) return;
+  // The server collector owns recording by default; this remains a fallback for disabled collectors.
+  if (get(wifiSurveyStorage).collector?.enabled !== false) return;
 
   const now = Date.now();
   const cellSizeM = get(wifiSurveyStorage).cellSizeM || 0.75;

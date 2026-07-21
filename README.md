@@ -78,6 +78,10 @@ services:
       # WIFI_MAP_CELL_SIZE_M: "0.75"
       # WIFI_MAP_MAX_POINTS: "2000"
       # WIFI_MAP_FLUSH_MS: "30000"
+      # WIFI_MAP_COLLECTOR_INTERVAL_MS: "10000"
+      # WIFI_MAP_COLLECTOR_TF_TIMEOUT_SEC: "2"
+      # WIFI_MAP_COLLECTOR_CELL_REVISIT_MS: "300000"
+      # WIFI_MAP_COLLECTOR_DISABLE: "0"
 ```
 
 1. Click **Deploy**
@@ -94,7 +98,7 @@ services:
 5. Create zones in the **Create zone** panel — pick a type, then **Add zone** (square at the map center) or draw a rectangle/circle. Use the **Selected zone** panel to name, retype, reorder, or remove the current zone.
 6. Use the tool dock on the right to edit your map geometry.
 7. Optional: turn on **Live robot** to poll pose from the running ROS container (requires the Docker socket mount). Position matches the map when TF uses the `map` frame; if only `odom` is available, the marker may drift relative to `map.json` until localization aligns. Status and mode lines update from ROS when topics respond in time.
-8. Optional: turn on **WiFi signal map** in the live robot panel. This also enables the live robot feed and records readings while the editor tab is open. The mower stores the shared survey in `/data/ros/wifi-signal-map.json`; every device refreshes it every 15 seconds. Use **Clear shared survey** to start a fresh measurement for all devices.
+8. Optional: turn on **WiFi signal map** in the live robot panel to display the heatmap. The mower records the survey autonomously without an open browser and stores it in `/data/ros/wifi-signal-map.json`; every browser refreshes the shared view every 15 seconds. Use **Clear shared survey** to start a fresh measurement for all devices.
 9. Save your edits:
   - **Save map.json** writes to `/data/ros/map.json` and creates a backup first (`map.json.bak-<timestamp>`).
   - **Save + restart ROS** does the same, then restarts the container set in `OPENMOWER_CONTAINER_NAME` through the mounted Docker socket.
@@ -107,19 +111,21 @@ services:
 
 ## WiFi survey storage
 
-The WiFi heatmap is shared mower-side state, not map geometry and not browser data:
+The WiFi heatmap is shared mower-side state, not map geometry and not browser data. No active browser session is required:
 
-- The browser combines each successful live pose with the mower's current `/proc/net/wireless` dBm reading and sends at most one reading every 2 seconds while moving, or every 5 seconds within the same cell.
+- The editor backend runs a lightweight collector every 10 seconds. It reads only the `map` to `base_link`/`base_footprint` TF and the mower's current `/proc/net/wireless` dBm value; it does not poll ROS status topics.
+- A newly visited cell is stored immediately. A known cell is sampled in memory but only recorded again after at least 5 minutes and a signal change of at least 3 dBm, avoiding repeated SD-card writes while the mower is stationary.
 - The backend merges readings into configurable spatial cells (`0.75 m` by default), keeps at most 2,000 cells, and evicts the oldest cell when the limit is reached. A full default survey is typically well below 200 KB.
 - In-memory changes are written atomically to `/data/ros/wifi-signal-map.json` no more than once every 30 seconds. A graceful container stop forces the final pending write. Ownership and mode follow the mower map directory (`openmower:openmower`, mode `664` on a standard deployment).
+- Clearing the survey first copies the current file to `/data/ros/wifi-signal-map.json.bak-clear`. The single backup is overwritten on the next clear, so this safety net has a fixed storage cost.
 - Browsers refresh the shared survey every 15 seconds. Revision-aware requests return metadata without resending the point list when nothing changed.
-- Existing survey points from the earlier browser-local implementation are imported once and then removed from `localStorage`. Only the user's on/off preference remains browser-local.
+- Existing survey points from the earlier browser-local implementation are imported once and then removed from `localStorage`. Only the user's on/off preference remains browser-local. If the autonomous collector is explicitly disabled, an open browser with live pose can still record as a fallback.
 
 API endpoints:
 
 - `GET /api/wifi-map?revision=<n>` returns the shared points, limits, file size, and revision. If `<n>` is current, the response contains `notModified: true` and omits the points.
 - `POST /api/wifi-map/samples` validates and merges one or more `{ x, y, signalDbm }` readings; the backend assigns the timestamp.
-- `DELETE /api/wifi-map` clears the shared survey for every connected device and flushes the empty state immediately.
+- `DELETE /api/wifi-map` backs up and then clears the shared survey for every connected device, flushing the empty state immediately.
 
 ## Tool Legend
 
@@ -208,6 +214,10 @@ Project layout:
 | `WIFI_MAP_CELL_SIZE_M` | `0.75` | Spatial cell size used to merge nearby readings |
 | `WIFI_MAP_MAX_POINTS` | `2000` | Hard upper bound for stored survey cells |
 | `WIFI_MAP_FLUSH_MS` | `30000` | Minimum delay between atomic disk writes |
+| `WIFI_MAP_COLLECTOR_INTERVAL_MS` | `10000` | Delay between autonomous WiFi samples (minimum 5 seconds) |
+| `WIFI_MAP_COLLECTOR_TF_TIMEOUT_SEC` | `2` | Timeout per TF frame attempted by the collector |
+| `WIFI_MAP_COLLECTOR_CELL_REVISIT_MS` | `300000` | Minimum age before a known cell may be recorded again |
+| `WIFI_MAP_COLLECTOR_DISABLE` | `0` | Set `1` to disable autonomous collection and use browser fallback |
 
 Inside the container the defaults match the bind mounts (`/data/ros`, `/data/params`); for local development point `MAP_PATH` / `PARAMS_PATH` at files in the repo.
 

@@ -4,7 +4,6 @@
     robotLive,
     robotReadout,
     robotPose,
-    setRobotLive,
     toggleRobotLive,
   } from "../lib/stores/robot.js";
   import {
@@ -22,7 +21,6 @@
   function toggleWifiMap() {
     const enabled = !$wifiMapEnabled;
     setWifiMapEnabled(enabled);
-    if (enabled && !$robotLive) setRobotLive(true);
   }
 
   function formatBytes(bytes) {
@@ -86,7 +84,7 @@
       <button
         class="btn-icon !h-7 !w-7"
         class:text-accent={$wifiMapEnabled}
-        title="Toggle WiFi heatmap and recording"
+        title="Toggle WiFi heatmap"
         on:click={toggleWifiMap}
       >
         <span class="material-symbols-outlined" style="font-size:22px">
@@ -124,7 +122,9 @@
           <span>≥ -55 dBm</span>
         </div>
         <div class="mt-2 text-[9px] leading-relaxed text-subtle">
-          Shared on mower · {$wifiSurveySummary.storage.cellSizeM} m grid ·
+          {$wifiSurveySummary.storage.collector?.enabled ? "Autonomous on mower" : "Browser fallback"} ·
+          {Math.round(($wifiSurveySummary.storage.collector?.intervalMs || 10000) / 1000)} s sample ·
+          {$wifiSurveySummary.storage.cellSizeM} m grid ·
           {Math.round($wifiSurveySummary.storage.flushIntervalMs / 1000)} s disk flush ·
           {formatBytes($wifiSurveySummary.storage.fileBytes)}
         </div>
